@@ -1,53 +1,59 @@
 import asyncio
-import csv
 import json
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
-from urllib.parse import urlencode
+from typing import Dict, List, Tuple, Optional
 
-from tqdm.auto import tqdm
-from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError, Browser, BrowserContext, Page, APIResponse
+import httpx
+from bs4 import BeautifulSoup
+from tqdm import tqdm
 
 # =========================
 # CONFIG
 # =========================
-INPUT_FILE = "applications.txt"            # one EP app per line
-OUT_DIR = Path("epo_register_pdfs")
-PROGRESS_FILE = Path("progress.json")
-FAIL_LOG = Path("failures.csv")
+@dataclass
+class Config:
+    INPUT_FILE: str = "applications.txt"                  # one EP per line (e.g., EP00900573)
+    OUT_DIR: Path = Path("epo_register_pdfs_httpx")
+    PROGRESS_FILE: Path = Path("progress.json")
+    FAIL_LOG: Path = Path("failures.log")
+    DEBUG_DIR: Path = Path("debug_dumps")
 
-HEADLESS = False
-LANG = "en"
-PAGE_TIMEOUT_MS = 40_000
-RETRY_ATTEMPTS = 2
-RATE_DELAY = 0.2
+    LANG: str = "en"                                      # "en" | "de" | "fr"
+    MAX_CONCURRENCY: int = 1                           # be nice to the site
+    RETRIES: int = 3
+    CONNECT_TIMEOUT: float = 15.0
+    READ_TIMEOUT: float = 45.0
+    RATE_DELAY: float = 4.0                             # small delay between EPs
 
-MAX_WORKERS = 4
-USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+    USER_AGENT: str = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 
-# ---- Filter: only these doc types will be downloaded (regex, case-insensitive)
+    FORCE: bool = True                                   # if True, re-download even if already done
+
+CFG = Config()
+
+# Extract EP-like tokens such as "EP00901189", "00901189", "EP 00901189"
+EP_TOKEN_RE = re.compile(r"(?:EP)?\s*\d{8,}", re.I)
+
+# ---- Filter (regex, case-insensitive)
 FILTER_DOC_TYPES = [
     r"\bDecision\s+revok(ing|ation)\s+the\s+European\s+patent\b",
     r"\bRequest\s+for\s+revok(ing|ation)\s+of\s+patent\b",
 ]
+PATTERNS = [re.compile(p, re.I) for p in FILTER_DOC_TYPES]
 
-# Download mode
-BULK_ZIP = True          # True = post selected IDs to /download to get a ZIP; False = individual PDFs
-ZIP_CHUNK_SIZE = 100     # not critical since we’re selecting few docs
-
-# =========================
-# Locks
-# =========================
-progress_lock = asyncio.Lock()
-fail_lock = asyncio.Lock()
+BASE = "https://register.epo.org/"
 
 # =========================
 # Helpers
 # =========================
+def ts() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
 def normalize_app(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", s).upper()
 
@@ -55,351 +61,419 @@ def ep_visible_name(s: str) -> str:
     n = normalize_app(s)
     return n if n.startswith("EP") else f"EP{n}"
 
-def load_apps(path: Path) -> List[str]:
-    if not path.exists():
-        print(f"Input file not found: {path}", file=sys.stderr)
-        sys.exit(1)
-    return [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+def app_doclist_url(app: str) -> str:
+    return f"{BASE}application?number={ep_visible_name(app)}&lng={CFG.LANG}&tab=doclist"
+
+def load_apps_txt(path: Path) -> List[str]:
+    """
+    Reads a .txt that may contain EP numbers separated by commas, spaces,
+    semicolons, or newlines (any mix). Returns unique EPs in original order.
+    """
+    text = path.read_text(encoding="utf-8")
+    tokens = EP_TOKEN_RE.findall(text)  # find all EP-like tokens
+    apps: List[str] = []
+    seen = set()
+    for tok in tokens:
+        ep = ep_visible_name(tok)  # normalizes to "EP########"
+        if ep not in seen:
+            seen.add(ep)
+            apps.append(ep)
+    return apps
 
 def load_progress() -> Dict[str, Dict]:
-    if PROGRESS_FILE.exists():
+    if CFG.PROGRESS_FILE.exists():
         try:
-            return json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
+            return json.loads(CFG.PROGRESS_FILE.read_text(encoding="utf-8"))
         except Exception:
             return {}
     return {}
 
-async def save_progress(progress: Dict[str, Dict]) -> None:
-    async with progress_lock:
-        PROGRESS_FILE.write_text(json.dumps(progress, indent=2, ensure_ascii=False), encoding="utf-8")
+def save_progress(progress: Dict[str, Dict]) -> None:
+    CFG.PROGRESS_FILE.write_text(json.dumps(progress, indent=2, ensure_ascii=False), encoding="utf-8")
 
-async def append_failure_rows(rows: List[Dict]):
-    if not rows:
-        return
-    async with fail_lock:
-        write_header = not FAIL_LOG.exists()
-        with FAIL_LOG.open("a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["timestamp", "app", "level", "context", "detail"])
-            if write_header:
-                writer.writeheader()
-            for r in rows:
-                writer.writerow(r)
+def log_fail(app: str, context: str, detail: str):
+    CFG.FAIL_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with CFG.FAIL_LOG.open("a", encoding="utf-8") as f:
+        f.write(f"{ts()} [{app}] {context}: {detail}\n")
 
-def ts() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
-
-def app_doclist_url(app: str) -> str:
-    return f"https://register.epo.org/application?number={ep_visible_name(app)}&lng={LANG}&tab=doclist"
-
-# =========================
-# Page helpers
-# =========================
-async def accept_cookies_if_present(page: Page):
-    try:
-        btn = page.locator("#onetrust-accept-btn-handler")
-        if await btn.count():
-            await btn.click(timeout=5_000)
-            await asyncio.sleep(0.2)
-            return
-    except Exception:
-        pass
-    try:
-        await page.get_by_role("button", name=re.compile("Accept all cookies", re.I)).click(timeout=3_000)
-        await asyncio.sleep(0.2)
-    except Exception:
-        pass
-
-async def open_doclist(page: Page, app: str):
-    await page.goto("https://register.epo.org/", timeout=PAGE_TIMEOUT_MS)
-    await accept_cookies_if_present(page)
-    await page.goto(app_doclist_url(app), timeout=PAGE_TIMEOUT_MS)
-    await accept_cookies_if_present(page)
-
-    try:
-        await page.wait_for_selector('table.docList', timeout=10_000)
-    except PWTimeoutError:
-        tab = page.locator('a[href*="tab=doclist"]')
-        if await tab.count():
-            await tab.first.click()
-        await page.wait_for_selector('table.docList', timeout=20_000)
-
-    # If there’s any Show more/More button, click until finished
-    while True:
-        clicked = False
-        for sel in [
-            'button:has-text("Show more")', 'a:has-text("Show more")',
-            'button:has-text("More")', 'a:has-text("More")',
-            'button:has-text("Load more")', 'a:has-text("Load more")',
-        ]:
-            el = page.locator(sel)
-            if await el.count():
+def ep_already_done(app_vis: str, progress: Dict[str, Dict]) -> bool:
+    state = progress.get(app_vis) or {}
+    if state.get("completed") is True and not CFG.FORCE:
+        return True
+    if not CFG.FORCE:
+        app_dir = CFG.OUT_DIR / app_vis
+        if app_dir.exists():
+            for p in app_dir.glob(f"{app_vis}_selected_*.zip"):
                 try:
-                    await el.first.click(timeout=2_000)
-                    await asyncio.sleep(0.25)
-                    clicked = True
-                    break
+                    if p.stat().st_size > 0:
+                        return True
                 except Exception:
                     pass
-        if not clicked:
-            break
+            # also consider PDFs already there
+            pdfs = list(app_dir.glob(f"{app_vis}_*.pdf"))
+            if any(p.exists() and p.stat().st_size > 0 for p in pdfs):
+                return True
+    return False
 
-async def collect_filtered(page: Page, app: str) -> List[Tuple[str, str]]:
-    """
-    Return [(doc_id, type_text)] filtered by FILTER_DOC_TYPES.
-    - doc_id from: input[name=identivier][value=…]
-    - type_text from the link text in 3rd column (the <a> inside that row)
-    """
-    await open_doclist(page, app)
+def ensure_dirs():
+    CFG.OUT_DIR.mkdir(parents=True, exist_ok=True)
+    CFG.DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
-    rows = await page.locator("table.docList tbody tr").all()
+def debug_dump(app_vis: str, name: str, content: bytes):
+    path = CFG.DEBUG_DIR / f"{app_vis}_{name}.html"
+    try:
+        path.write_bytes(content)
+    except Exception:
+        pass
+
+def is_pdf_response(resp: httpx.Response) -> bool:
+    ctype = (resp.headers.get("content-type") or "").lower()
+    if "application/pdf" in ctype:
+        return True
+    if resp.content[:4] == b"%PDF":
+        return True
+    return False
+
+def sanitize_filename(s: str, limit: int = 80) -> str:
+    s = re.sub(r"[^\w\-_. ]+", "_", s)
+    return s[:limit] if len(s) > limit else s
+
+# =========================
+# HTML parsing
+# =========================
+def parse_doclist_for_matches(html: str) -> List[Tuple[str, str]]:
+    """
+    Return [(doc_id, doc_text)] where doc_text matches PATTERNS.
+    doc_id is from input[name=identifier|identivier|identivierId] value.
+    doc_text is anchor text in the 3rd column.
+    """
+    # Try lxml first; fallback to html.parser if not installed
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+
+    table = soup.select_one("table.docList")
+    if not table:
+        return []
+
     out: List[Tuple[str, str]] = []
-
-    # Compile patterns once
-    pats = [re.compile(p, re.I) for p in FILTER_DOC_TYPES]
-
-    for row in rows:
-        # doc id
-        cb = row.locator('input[name="identivier"]')
-        if await cb.count() == 0:
-            continue
-        doc_id = await cb.first.get_attribute("value")
+    rows = table.select("tbody tr") or []
+    for tr in rows:
+        doc_id = None
+        for name in ["identifier", "identivier", "identivierId"]:
+            inp = tr.select_one(f'input[name="{name}"]')
+            if inp and inp.get("value"):
+                doc_id = inp["value"].strip()
+                break
         if not doc_id:
             continue
 
-        # doc type text = anchor text in 3rd column
-        a = row.locator("td:nth-child(3) a")
-        doc_text = (await a.text_content() or "").strip()
-
-        if any(p.search(doc_text) for p in pats):
-            out.append((doc_id, doc_text))
-
-    # de-dupe by doc_id preserving order
-    seen, filt = set(), []
-    for did, txt in out:
-        if did not in seen:
-            filt.append((did, txt))
-            seen.add(did)
-    return filt
-
-# =========================
-# Downloaders
-# =========================
-async def download_pdf(context: BrowserContext, ep: str, doc_id: str, out_path: Path) -> bool:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    base = "https://register.epo.org/application"
-    url = f"{base}?{urlencode({'documentId': doc_id, 'number': ep_visible_name(ep), 'lng': LANG, 'npl': 'false'})}"
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
-        try:
-            resp: APIResponse = await context.request.get(url, timeout=30_000)
-            if resp.ok:
-                data = await resp.body()
-                if data:
-                    out_path.write_bytes(data)
-                    return True
-        except Exception:
-            pass
-        await asyncio.sleep(0.5 * attempt)
-    return False
-
-async def download_zip_selected(context: BrowserContext, ep: str, doc_ids: List[str], out_zip: Path) -> bool:
-    out_zip.parent.mkdir(parents=True, exist_ok=True)
-    url = "https://register.epo.org/download"
-    payload = {
-        "documentIdentifiers": "+".join(doc_ids),   # same as the page’s form
-        "number": ep_visible_name(ep),
-        "unip": "false",
-        "output": "zip",
-    }
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
-        try:
-            resp: APIResponse = await context.request.post(url, form=payload, timeout=60_000)
-            if resp.ok:
-                data = await resp.body()
-                if data:
-                    out_zip.write_bytes(data)
-                    return True
-        except Exception:
-            pass
-        await asyncio.sleep(0.8 * attempt)
-    return False
-
-# =========================
-# Per-application
-# =========================
-async def process_app(context: BrowserContext, app: str, progress: Dict[str, Dict],
-                      filtered: List[Tuple[str, str]] | None = None,
-                      app_pbar: tqdm | None = None) -> Tuple[int, List[Dict]]:
-    failures: List[Dict] = []
-    norm = normalize_app(app)
-    app_vis = ep_visible_name(app)
-    app_dir = OUT_DIR / app_vis
-    app_dir.mkdir(parents=True, exist_ok=True)
-
-    # resume info
-    async with progress_lock:
-        app_state = progress.get(norm, {"downloaded_docIds": []})
-        downloaded_docids = set(app_state.get("downloaded_docIds", []))
-
-    page = await context.new_page()
-    page.set_default_timeout(PAGE_TIMEOUT_MS)
-    try:
-        if filtered is None:
-            filtered = await collect_filtered(page, app)
-    except Exception as e:
-        failures.append({"timestamp": ts(), "app": app_vis, "level": "APP",
-                         "context": "collect_filtered", "detail": repr(e)})
-        await page.close()
-        return 0, failures
-    await page.close()
-
-    if app_pbar:
-        app_pbar.total = len(filtered)
-        app_pbar.refresh()
-
-    if not filtered:
-        # nothing to do
-        if app_pbar:
-            app_pbar.close()
-        return 0, failures
-
-    # Bulk ZIP path (faster even for a few docs)
-    if BULK_ZIP:
-        doc_ids = [d for d, _ in filtered]
-        zip_name = f"{app_vis}_selected_{len(doc_ids)}.zip"
-        out_zip = app_dir / zip_name
-        ok = await download_zip_selected(context, app_vis, doc_ids, out_zip)
-        if ok and out_zip.exists() and out_zip.stat().st_size > 0:
-            async with progress_lock:
-                downloaded_docids.update(doc_ids)
-                progress[norm] = {"downloaded_docIds": sorted(downloaded_docids)}
-                await save_progress(progress)
-            if app_pbar:
-                app_pbar.update(len(doc_ids))
-            return len(doc_ids), failures
-        else:
-            failures.append({"timestamp": ts(), "app": app_vis, "level": "FILE",
-                             "context": "ZIP selected", "detail": "zip_download_failed"})
-            if app_pbar:
-                app_pbar.update(len(doc_ids))
-            return 0, failures
-
-    # Individual PDFs
-    downloaded_count = 0
-    for idx, (doc_id, label) in enumerate(filtered, start=1):
-        already = doc_id in downloaded_docids and any(
-            p.name.endswith(f"_{doc_id}.pdf") for p in app_dir.glob(f"*_{doc_id}.pdf")
-        )
-        if already:
-            if app_pbar: app_pbar.update(1)
+        tds = tr.find_all("td")
+        if len(tds) < 3:
+            continue
+        a = tds[2].find("a")
+        doc_text = (a.get_text(strip=True) if a else tds[2].get_text(strip=True)) or ""
+        if not doc_text:
             continue
 
-        safe_label = re.sub(r"[^\w\-_. ]+", "_", label)[:80] or "document"
-        fname = f"{app_vis}_{idx:03d}_{safe_label}_{doc_id}.pdf"
-        out_pdf = app_dir / fname
+        if any(p.search(doc_text) for p in PATTERNS):
+            out.append((doc_id, doc_text))
 
-        ok = await download_pdf(context, app_vis, doc_id, out_pdf)
-        if ok and out_pdf.exists() and out_pdf.stat().st_size > 0:
-            downloaded_count += 1
-            downloaded_docids.add(doc_id)
-            async with progress_lock:
-                progress[norm] = {"downloaded_docIds": sorted(downloaded_docids)}
-                await save_progress(progress)
-        else:
-            failures.append({"timestamp": ts(), "app": app_vis, "level": "FILE",
-                             "context": f"{doc_id} ({label})", "detail": "pdf_download_failed"})
+    # de-dupe by doc_id
+    seen = set()
+    dedup: List[Tuple[str, str]] = []
+    for did, txt in out:
+        if did not in seen:
+            seen.add(did)
+            dedup.append((did, txt))
+    return dedup
 
-        if app_pbar:
-            app_pbar.update(1)
-        await asyncio.sleep(RATE_DELAY)
-
-    return downloaded_count, failures
-
-# =========================
-# Worker / Orchestration
-# =========================
-async def worker(name: int, browser: Browser, queue: asyncio.Queue,
-                 progress: Dict[str, Dict], global_pbar: tqdm):
-    failures_batch: List[Dict] = []
-    context = await browser.new_context(
-        accept_downloads=True,
-        user_agent=USER_AGENT,
-        java_script_enabled=True,
-        viewport={"width": 1400, "height": 900}
-    )
+def extract_iframe_src(html: str) -> Optional[str]:
     try:
-        while True:
-            try:
-                app = await asyncio.wait_for(queue.get(), timeout=1.0)
-            except asyncio.TimeoutError:
-                if queue.empty():
-                    break
-                continue
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+    ifr = soup.find("iframe")
+    if ifr and ifr.get("src"):
+        return ifr["src"]
+    return None
 
-            app_vis = ep_visible_name(app)
+# =========================
+# Network ops
+# =========================
+def common_headers() -> Dict[str, str]:
+    return {
+        "User-Agent": CFG.USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
+        "Connection": "keep-alive",
+    }
 
-            # Collect filtered list first to size the per-app bar
-            filtered: List[Tuple[str, str]] = []
-            page = await context.new_page()
-            page.set_default_timeout(PAGE_TIMEOUT_MS)
+def download_headers() -> Dict[str, str]:
+    return {
+        "User-Agent": CFG.USER_AGENT,
+        "Referer": BASE,
+        "Origin": BASE.rstrip("/"),
+        "Accept": "application/zip,application/octet-stream,*/*",
+        "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Connection": "keep-alive",
+    }
+
+def pdf_headers(referer: str) -> Dict[str, str]:
+    return {
+        "User-Agent": CFG.USER_AGENT,
+        "Accept": "application/pdf,application/octet-stream,*/*",
+        "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
+        "Referer": referer,
+        "Connection": "keep-alive",
+    }
+
+async def get_doclist_html(client: httpx.AsyncClient, app: str) -> Optional[str]:
+    # Warm-up GET to set cookies
+    try:
+        await client.get(BASE, headers=common_headers(), timeout=CFG.CONNECT_TIMEOUT)
+    except Exception:
+        pass
+
+    url = app_doclist_url(app)
+    for attempt in range(1, CFG.RETRIES + 1):
+        try:
+            r = await client.get(url, headers=common_headers(), timeout=CFG.READ_TIMEOUT)
+            if r.status_code == 200 and ("docList" in r.text or "<table" in r.text):
+                return r.text
+        except Exception:
+            if attempt == CFG.RETRIES:
+                return None
+        await asyncio.sleep(0.4 * attempt)
+    return None
+
+async def post_zip_download(client: httpx.AsyncClient, app_vis: str, doc_ids: List[str]) -> Optional[bytes]:
+    """
+    POST /download with the same fields the UI uses.
+    Try a couple of param variants (number/appnumber, add lng).
+    """
+    if not doc_ids:
+        return None
+
+    forms = [
+        {"documentIdentifiers": "+".join(doc_ids), "number": app_vis, "unip": "false", "output": "zip"},
+        {"documentIdentifiers": "+".join(doc_ids), "appnumber": app_vis, "unip": "false", "output": "zip"},
+        {"documentIdentifiers": "+".join(doc_ids), "number": app_vis, "lng": CFG.LANG, "unip": "false", "output": "zip"},
+        {"documentIdentifiers": "+".join(doc_ids), "appnumber": app_vis, "lng": CFG.LANG, "unip": "false", "output": "zip"},
+    ]
+
+    for payload in forms:
+        for attempt in range(1, CFG.RETRIES + 1):
             try:
-                filtered = await collect_filtered(page, app)
+                r = await client.post(f"{BASE}download", data=payload, headers=download_headers(), timeout=CFG.READ_TIMEOUT)
+                if r.status_code == 200:
+                    ctype = (r.headers.get("content-type") or "").lower()
+                    if "application/zip" in ctype or "application/octet-stream" in ctype or (r.content and r.content.startswith(b"PK")):
+                        return r.content if r.content else None
+                    # capture HTML error for debugging
+                    if "text/html" in ctype and r.content:
+                        debug_dump(app_vis, f"zip_error_{attempt}", r.content)
+                else:
+                    # unexpected status
+                    if r.content:
+                        debug_dump(app_vis, f"zip_status_{r.status_code}_attempt{attempt}", r.content)
             except Exception as e:
-                failures_batch.append({"timestamp": ts(), "app": app_vis, "level": "APP",
-                                       "context": "collect_filtered", "detail": repr(e)})
-                await page.close()
-                global_pbar.update(1)
-                queue.task_done()
-                continue
-            await page.close()
+                if attempt == CFG.RETRIES:
+                    pass
+            await asyncio.sleep(0.6 * attempt)
+    return None
 
-            app_pbar = tqdm(total=len(filtered), desc=f"{app_vis} (docs)",
-                            position=name, leave=False, dynamic_ncols=True)
+async def get_pdf_via_variants(client: httpx.AsyncClient, app_vis: str, doc_id: str, referer: str) -> Optional[bytes]:
+    """
+    Try multiple URL variants to fetch a single PDF.
+    Also follow viewer page to its iframe src when needed.
+    """
+    # Variants that often yield raw PDF
+    variants = [
+        {"params": {"documentId": doc_id, "number": app_vis, "lng": CFG.LANG, "npl": "false"}},
+        {"params": {"documentId": doc_id, "appnumber": app_vis, "lng": CFG.LANG, "npl": "false"}},
+        {"params": {"documentId": doc_id, "number": app_vis, "lng": CFG.LANG}},
+        {"params": {"documentId": doc_id, "appnumber": app_vis, "lng": CFG.LANG}},
+    ]
+    for v in variants:
+        try:
+            r = await client.get(f"{BASE}application", params=v["params"], headers=pdf_headers(referer), timeout=CFG.READ_TIMEOUT)
+            if r.status_code == 200 and is_pdf_response(r):
+                return r.content
+            # If HTML viewer page, try to follow its iframe src
+            if r.status_code == 200 and (b"<iframe" in r.content or b"Register Plus PDF viewer" in r.content):
+                src = extract_iframe_src(r.text)
+                if src:
+                    # make absolute
+                    if src.startswith("/"):
+                        url = BASE.rstrip("/") + src
+                    elif src.startswith("http"):
+                        url = src
+                    else:
+                        url = f"{BASE}{src.lstrip('/')}"
+                    r2 = await client.get(url, headers=pdf_headers(referer), timeout=CFG.READ_TIMEOUT)
+                    if r2.status_code == 200 and is_pdf_response(r2):
+                        return r2.content
+        except Exception:
+            pass
+    return None
 
-            try:
-                downloaded, fails = await process_app(context, app, progress, filtered=filtered, app_pbar=app_pbar)
-                failures_batch.extend(fails)
-            except Exception as e:
-                failures_batch.append({"timestamp": ts(), "app": app_vis, "level": "APP",
-                                       "context": "worker_exception", "detail": repr(e)})
-            finally:
-                app_pbar.close()
-                global_pbar.update(1)
-                queue.task_done()
+# =========================
+# Main per-EP workflow
+# =========================
+async def process_ep(app: str, progress: Dict[str, Dict], client: httpx.AsyncClient, pbar: tqdm) -> Tuple[str, int, str]:
+    """
+    Returns (EP, downloaded_count, message)
+    """
+    app_vis = ep_visible_name(app)
+    app_dir = (CFG.OUT_DIR / app_vis)
+    app_dir.mkdir(parents=True, exist_ok=True)
 
-            if len(failures_batch) >= 10:
-                await append_failure_rows(failures_batch)
-                failures_batch.clear()
+    # Skip if already completed (unless FORCE=True)
+    if ep_already_done(app_vis, progress):
+        pbar.write(f"[{app_vis}] Already downloaded previously; skipping (set FORCE=True to redo).")
+        return app_vis, 0, "skipped_complete"
 
-        if failures_batch:
-            await append_failure_rows(failures_batch)
-            failures_batch.clear()
-    finally:
-        await context.close()
+    # resume info
+    app_state = progress.get(app_vis, {"downloaded_docIds": []})
+    downloaded_docids = set(app_state.get("downloaded_docIds", []))
 
+    # 1) get doclist html
+    html = await get_doclist_html(client, app_vis)
+    if not html:
+        pbar.write(f"[{app_vis}] Could not load doclist.")
+        log_fail(app_vis, "doclist", "load_failed")
+        return app_vis, 0, "doclist_failed"
+
+    # 2) parse matching docs
+    matches = parse_doclist_for_matches(html)
+    if not matches:
+        pbar.write(f"[{app_vis}] No documents matched filters; skipping.")
+        progress[app_vis] = {
+            "completed": True,     # nothing to do, but mark handled
+            "zip_file": None,
+            "downloaded_docIds": sorted(downloaded_docids),
+            "doc_count": 0,
+            "timestamp": ts(),
+        }
+        return app_vis, 0, "no_matches"
+
+    needed_pairs = [(d, t) for (d, t) in matches if d not in downloaded_docids]
+    if not needed_pairs and not CFG.FORCE:
+        pbar.write(f"[{app_vis}] Already have all matching docs; skipping.")
+        progress[app_vis] = {
+            "completed": True,
+            "zip_file": None,
+            "downloaded_docIds": sorted(downloaded_docids),
+            "doc_count": len(downloaded_docids),
+            "timestamp": ts(),
+        }
+        return app_vis, 0, "up_to_date"
+
+    # 3) try ZIP download
+    doc_ids = [d for d, _ in (needed_pairs or matches)]
+    content = await post_zip_download(client, app_vis, doc_ids)
+    if content:
+        zip_path = app_dir / f"{app_vis}_selected_{len(doc_ids)}.zip"
+        zip_path.write_bytes(content)
+        new_ids = set(downloaded_docids) | set(doc_ids)
+        progress[app_vis] = {
+            "completed": True,
+            "zip_file": zip_path.name,
+            "downloaded_docIds": sorted(new_ids),
+            "doc_count": len(new_ids),
+            "timestamp": ts(),
+        }
+        pbar.write(f"[{app_vis}] ZIP saved: {zip_path.name} ({len(doc_ids)} docs)")
+        await asyncio.sleep(CFG.RATE_DELAY)
+        return app_vis, len(doc_ids), "ok"
+
+    # 4) fallback: download individual PDFs
+    pbar.write(f"[{app_vis}] ZIP failed; falling back to individual PDFs...")
+    referer = app_doclist_url(app_vis)
+    ok_count = 0
+    new_ids = set(downloaded_docids)
+
+    for idx, (doc_id, label) in enumerate(needed_pairs or matches, start=1):
+        if doc_id in new_ids and not CFG.FORCE:
+            continue
+        try:
+            pdf = await get_pdf_via_variants(client, app_vis, doc_id, referer)
+            if pdf:
+                safe_label = sanitize_filename(label) or "document"
+                pdf_path = app_dir / f"{app_vis}_{idx:03d}_{safe_label}_{doc_id}.pdf"
+                pdf_path.write_bytes(pdf)
+                ok_count += 1
+                new_ids.add(doc_id)
+            else:
+                # save debug when we couldn't get PDF
+                debug_dump(app_vis, f"pdf_fail_{doc_id}", b"")
+        except Exception as e:
+            log_fail(app_vis, f"pdf_{doc_id}", repr(e))
+
+    if ok_count > 0:
+        progress[app_vis] = {
+            "completed": True,
+            "zip_file": None,
+            "downloaded_docIds": sorted(new_ids),
+            "doc_count": len(new_ids),
+            "timestamp": ts(),
+        }
+        pbar.write(f"[{app_vis}] Downloaded {ok_count} PDF(s) individually.")
+        await asyncio.sleep(CFG.RATE_DELAY)
+        return app_vis, ok_count, "ok_partial" if ok_count < len(doc_ids) else "ok"
+
+    # if we reach here, everything failed
+    pbar.write(f"[{app_vis}] All download attempts failed.")
+    log_fail(app_vis, "download", "zip_and_individual_failed")
+    return app_vis, 0, "failed"
+
+# =========================
+# Runner
+# =========================
 async def main():
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    apps = load_apps(Path(INPUT_FILE))
+    ensure_dirs()
+    apps = load_apps_txt(Path(CFG.INPUT_FILE))
     progress = load_progress()
 
-    queue: asyncio.Queue = asyncio.Queue()
-    for app in apps:
-        await queue.put(app)
+    # Optional: pre-filter EPs already completed to start faster
+    if not CFG.FORCE:
+        apps = [ep for ep in apps if not ep_already_done(ep_visible_name(ep), progress)]
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=HEADLESS)
-        with tqdm(total=len(apps), desc="Applications", position=0, dynamic_ncols=True) as global_pbar:
-            workers = [asyncio.create_task(worker(i + 1, browser, queue, progress, global_pbar))
-                       for i in range(MAX_WORKERS)]
-            await queue.join()
-            for w in workers:
-                w.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
-        await browser.close()
+    limits = httpx.Limits(max_connections=CFG.MAX_CONCURRENCY, max_keepalive_connections=CFG.MAX_CONCURRENCY)
+    timeout = httpx.Timeout(CFG.CONNECT_TIMEOUT, read=CFG.READ_TIMEOUT)
+    results = []
 
-    print(f"\nDone. Output under: {OUT_DIR}")
-    print(f"Resume state: {PROGRESS_FILE}")
-    if FAIL_LOG.exists():
-        print(f"Failures recorded in: {FAIL_LOG}")
+    async with httpx.AsyncClient(http2=True, limits=limits, timeout=timeout, follow_redirects=True) as client:
+        sem = asyncio.Semaphore(CFG.MAX_CONCURRENCY)
+
+        async def worker(ep: str, pbar: tqdm):
+            async with sem:
+                try:
+                    return await process_ep(ep, progress, client, pbar)
+                except Exception as e:
+                    log_fail(ep_visible_name(ep), "worker", repr(e))
+                    return ep_visible_name(ep), 0, f"error:{e}"
+
+        with tqdm(total=len(apps), desc="Applications", unit="app") as pbar:
+            tasks = [worker(ep, pbar) for ep in apps]
+            for coro in asyncio.as_completed(tasks):
+                res = await coro
+                results.append(res)
+                pbar.update(1)
+
+    save_progress(progress)
+
+    ok = sum(1 for _, _, msg in results if msg.startswith("ok"))
+    print(f"\nDone. Output under: {CFG.OUT_DIR}")
+    print(f"Progress state: {CFG.PROGRESS_FILE}")
+    print(f"Completed OK (incl. partial): {ok}/{len(apps)}")
+    if Path(CFG.FAIL_LOG).exists():
+        print(f"Failures logged in: {CFG.FAIL_LOG}")
+    if CFG.DEBUG_DIR.exists():
+        print(f"Debug HTML dumps (if any): {CFG.DEBUG_DIR}")
 
 if __name__ == "__main__":
     asyncio.run(main())
